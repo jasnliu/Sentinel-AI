@@ -29,6 +29,7 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import org.pytorch.IValue;
+import org.pytorch.LiteModuleLoader;
 import org.pytorch.Module;
 import org.pytorch.Tensor;
 import org.pytorch.torchvision.TensorImageUtils;
@@ -41,6 +42,8 @@ import java.util.Arrays;
 
 public class MainActivity extends AppCompatActivity {
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 100;
+    private static final String MODEL_ASSET_NAME = "forest_fire_classifier_mobilenetv3_small.ptl";
+    private static final int FIRE_CLASS_INDEX = 0;
     private TextureView textureView;
     private TextView tvResult;
     private Button btnProcess;
@@ -108,7 +111,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         try {
-            module = Module.load(assetFilePath("model.pt"));
+            module = LiteModuleLoader.load(assetFilePath(MODEL_ASSET_NAME));
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -193,11 +196,11 @@ public class MainActivity extends AppCompatActivity {
 
         int maxScoreIdx = getMaxScoreIndex(scores);
 
-        if (maxScoreIdx == 0) {
+        if (maxScoreIdx == FIRE_CLASS_INDEX) {
             tvResult.setText("FIRE");
             tvResult.setTextColor(getResources().getColor(android.R.color.holo_red_dark));
         } else {
-            tvResult.setText("Normal");
+            tvResult.setText("NO FIRE");
             tvResult.setTextColor(getResources().getColor(android.R.color.holo_green_dark));
         }
     }
@@ -280,5 +283,4 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 }
-
 
