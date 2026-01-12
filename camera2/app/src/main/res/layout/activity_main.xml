@@ -13,12 +13,12 @@
         android:id="@+id/btn_process"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Process" />
+        android:text="Stop monitoring" />
 
     <TextView
         android:id="@+id/tv_result"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:textSize="40sp"
+        android:textSize="28sp"
         android:layout_marginTop="30dp" />
 </LinearLayout>

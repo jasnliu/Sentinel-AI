@@ -1,0 +1,13 @@
+services:
+  sentinel-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      - API_KEY=change-me
+      - DATA_DIR=/data
+      - RETENTION_DAYS=30
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./server/data:/data

@@ -9,16 +9,15 @@ import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
-import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CameraMetadata;
-import android.hardware.camera2.params.StreamConfigurationMap;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Looper;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.provider.Settings;
@@ -47,12 +46,20 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
+import java.util.UUID;
 
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 100;
     private static final String MODEL_ASSET_NAME = "forest_fire_classifier_mobilenetv3_small.ptl";
     private static final int FIRE_CLASS_INDEX = 0;
+    private static final boolean DEBUG_DUMP_PREPROCESSED_IMAGES = false;
+
+    private static final long CAPTURE_INTERVAL_MS = 5_000;
+    private static final float FIRE_CONFIDENCE_THRESHOLD = 0.80f;
+    private static final int REQUIRED_CONSECUTIVE_HITS = 3;
+    private static final long ALERT_COOLDOWN_MS = 60_000;
+
     private TextureView textureView;
     private TextView tvResult;
     private Button btnProcess;
@@ -60,19 +67,40 @@ public class MainActivity extends AppCompatActivity {
     private CameraCaptureSession cameraCaptureSession;
     private CaptureRequest.Builder captureRequestBuilder;
     private Module module;
-    private static final int REQUEST_CAMERA_PERMISSION = 200;
     private final Size imageSize = new Size(224, 224);
 
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
     private boolean hasPromptedForAllFilesAccess = false;
 
+    private Handler mainHandler;
+    private boolean monitoringEnabled = true;
+    private int consecutiveFireHits = 0;
+    private long lastAlertUploadMs = 0;
+
+    private AlertReporter alertReporter;
+    private String deviceId;
+    private final Runnable monitorTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!monitoringEnabled) {
+                return;
+            }
+            captureAndProcessImage();
+            mainHandler.postDelayed(this, CAPTURE_INTERVAL_MS);
+        }
+    };
+
     // Define the SurfaceTextureListener
     private final TextureView.SurfaceTextureListener textureListener = new TextureView.SurfaceTextureListener() {
         @Override
         public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
             // When the TextureView is available, open the camera
-            openCamera();
+            startBackgroundThread();
+            if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED) {
+                openCamera();
+            }
         }
 
         @Override
@@ -99,24 +127,31 @@ public class MainActivity extends AppCompatActivity {
         textureView = findViewById(R.id.texture_view);
         tvResult = findViewById(R.id.tv_result);
         btnProcess = findViewById(R.id.btn_process);
+        mainHandler = new Handler(Looper.getMainLooper());
+
+        deviceId = getOrCreateDeviceId();
+        alertReporter = new AlertReporter(BuildConfig.SERVER_BASE_URL, BuildConfig.SERVER_API_KEY);
 
         // Request camera permission if not already granted
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA},
                     CAMERA_PERMISSION_REQUEST_CODE);
-        } else {
-            if (textureView.isAvailable()) {
-                openCamera();
-            } else {
-                textureView.setSurfaceTextureListener(textureListener);
-            }
+        } else if (!textureView.isAvailable()) {
+            textureView.setSurfaceTextureListener(textureListener);
         }
 
         btnProcess.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                captureAndProcessImage();
+                monitoringEnabled = !monitoringEnabled;
+                if (monitoringEnabled) {
+                    btnProcess.setText("Stop monitoring");
+                    startMonitoring();
+                } else {
+                    btnProcess.setText("Start monitoring");
+                    stopMonitoring();
+                }
             }
         });
 
@@ -131,9 +166,6 @@ public class MainActivity extends AppCompatActivity {
         CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
         try {
             String cameraId = manager.getCameraIdList()[0];
-            CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
-            StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            Size previewSize = map.getOutputSizes(SurfaceTexture.class)[0];
             manager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(@NonNull CameraDevice camera) {
@@ -192,33 +224,100 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void captureAndProcessImage() {
-        Bitmap bitmap = textureView.getBitmap();
-        if (bitmap == null) {
+        final Bitmap bitmap = textureView.getBitmap();
+        if (bitmap == null || module == null || backgroundHandler == null) {
             return;
         }
 
-        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true);
-        Bitmap centerCroppedBitmap = Bitmap.createBitmap(resizedBitmap, 16, 16, 224, 224);
-        dumpPreprocessedImage(centerCroppedBitmap);
+        backgroundHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    processBitmap(bitmap);
+                } finally {
+                    bitmap.recycle();
+                }
+            }
+        });
+    }
 
-        final Tensor inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
-                centerCroppedBitmap,
-                TensorImageUtils.TORCHVISION_NORM_MEAN_RGB,
-                TensorImageUtils.TORCHVISION_NORM_STD_RGB
-        );
+    private void processBitmap(Bitmap bitmap) {
+        Bitmap resizedBitmap = null;
+        Bitmap centerCroppedBitmap = null;
+        try {
+            resizedBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true);
+            centerCroppedBitmap = Bitmap.createBitmap(resizedBitmap, 16, 16, 224, 224);
+            if (DEBUG_DUMP_PREPROCESSED_IMAGES) {
+                dumpPreprocessedImage(centerCroppedBitmap);
+            }
 
-        Tensor outputTensor = module.forward(IValue.from(inputTensor)).toTensor();
-        float[] scores = outputTensor.getDataAsFloatArray();
-        Log.d(TAG, "scores=" + Arrays.toString(scores));
+            final Tensor inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
+                    centerCroppedBitmap,
+                    TensorImageUtils.TORCHVISION_NORM_MEAN_RGB,
+                    TensorImageUtils.TORCHVISION_NORM_STD_RGB
+            );
 
-        boolean isFire = scores[FIRE_CLASS_INDEX] > scores[1];
-        if (isFire) {
-            tvResult.setText("FIRE");
-            tvResult.setTextColor(getResources().getColor(android.R.color.holo_red_dark));
-        } else {
-            tvResult.setText("NO FIRE");
-            tvResult.setTextColor(getResources().getColor(android.R.color.holo_green_dark));
+            Tensor outputTensor = module.forward(IValue.from(inputTensor)).toTensor();
+            float[] scores = outputTensor.getDataAsFloatArray();
+            Log.d(TAG, "scores=" + Arrays.toString(scores));
+            if (scores.length < 2) {
+                Log.w(TAG, "Unexpected output size: " + scores.length);
+                return;
+            }
+
+            float fireProb = softmax2(scores[FIRE_CLASS_INDEX], scores[1]);
+            final boolean isFire = fireProb >= FIRE_CONFIDENCE_THRESHOLD;
+
+            if (isFire) {
+                consecutiveFireHits += 1;
+            } else {
+                consecutiveFireHits = 0;
+            }
+
+            final String uiText = (isFire ? "FIRE" : "NO FIRE")
+                    + "\nconfidence=" + String.format("%.3f", fireProb)
+                    + "\nhits=" + consecutiveFireHits + "/" + REQUIRED_CONSECUTIVE_HITS;
+
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    tvResult.setText(uiText);
+                    tvResult.setTextColor(getResources().getColor(
+                            isFire ? android.R.color.holo_red_dark : android.R.color.holo_green_dark
+                    ));
+                }
+            });
+
+            long nowMs = System.currentTimeMillis();
+            boolean shouldUpload = isFire
+                    && consecutiveFireHits >= REQUIRED_CONSECUTIVE_HITS
+                    && (nowMs - lastAlertUploadMs) >= ALERT_COOLDOWN_MS;
+            if (shouldUpload) {
+                lastAlertUploadMs = nowMs;
+                alertReporter.reportAlert(
+                        deviceId,
+                        nowMs,
+                        fireProb,
+                        consecutiveFireHits,
+                        centerCroppedBitmap
+                );
+                consecutiveFireHits = 0;
+            }
+        } finally {
+            if (resizedBitmap != null) {
+                resizedBitmap.recycle();
+            }
+            if (centerCroppedBitmap != null) {
+                centerCroppedBitmap.recycle();
+            }
         }
+    }
+
+    private static float softmax2(float a, float b) {
+        float max = Math.max(a, b);
+        double expA = Math.exp(a - max);
+        double expB = Math.exp(b - max);
+        return (float) (expA / (expA + expB));
     }
 
     private void dumpPreprocessedImage(Bitmap bitmap) {
@@ -308,6 +407,9 @@ public class MainActivity extends AppCompatActivity {
 
     // Start the background thread
     private void startBackgroundThread() {
+        if (backgroundThread != null) {
+            return;
+        }
         backgroundThread = new HandlerThread("CameraBackground");
         backgroundThread.start();
         backgroundHandler = new Handler(backgroundThread.getLooper());
@@ -315,6 +417,9 @@ public class MainActivity extends AppCompatActivity {
 
     // Stop the background thread
     private void stopBackgroundThread() {
+        if (backgroundThread == null) {
+            return;
+        }
         backgroundThread.quitSafely();
         try {
             backgroundThread.join();
@@ -329,15 +434,24 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         startBackgroundThread();
-        if (textureView.isAvailable()) {
-            openCamera();
-        } else {
+        if (!textureView.isAvailable()) {
             textureView.setSurfaceTextureListener(textureListener);
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED && textureView.isAvailable()) {
+            openCamera();
+        }
+        if (monitoringEnabled) {
+            btnProcess.setText("Stop monitoring");
+            startMonitoring();
+        } else {
+            btnProcess.setText("Start monitoring");
         }
     }
 
     @Override
     protected void onPause() {
+        stopMonitoring();
         closeCamera();
         stopBackgroundThread();
         super.onPause();
@@ -351,6 +465,51 @@ public class MainActivity extends AppCompatActivity {
         if (cameraDevice != null) {
             cameraDevice.close();
             cameraDevice = null;
+        }
+    }
+
+    private void startMonitoring() {
+        if (mainHandler == null) {
+            return;
+        }
+        mainHandler.removeCallbacks(monitorTick);
+        mainHandler.post(monitorTick);
+    }
+
+    private void stopMonitoring() {
+        if (mainHandler == null) {
+            return;
+        }
+        mainHandler.removeCallbacks(monitorTick);
+        consecutiveFireHits = 0;
+    }
+
+    private String getOrCreateDeviceId() {
+        String prefsName = "sentinel_prefs";
+        String key = "device_id";
+        String existing = getSharedPreferences(prefsName, MODE_PRIVATE).getString(key, null);
+        if (existing != null && !existing.trim().isEmpty()) {
+            return existing;
+        }
+        String id = UUID.randomUUID().toString();
+        getSharedPreferences(prefsName, MODE_PRIVATE).edit().putString(key, id).apply();
+        return id;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != CAMERA_PERMISSION_REQUEST_CODE) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (textureView.isAvailable()) {
+                openCamera();
+            } else {
+                textureView.setSurfaceTextureListener(textureListener);
+            }
+        } else {
+            Toast.makeText(this, "Camera permission is required", Toast.LENGTH_LONG).show();
         }
     }
 }

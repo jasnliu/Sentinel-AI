@@ -13,6 +13,9 @@ android {
         versionCode 1
         versionName "1.0"
 
+        buildConfigField "String", "SERVER_BASE_URL", "\"http://10.0.2.2:8000\""
+        buildConfigField "String", "SERVER_API_KEY", "\"change-me\""
+
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -28,6 +31,7 @@ android {
     }
     buildFeatures {
         viewBinding true
+        buildConfig true
     }
 }
 
@@ -44,4 +48,5 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'org.pytorch:pytorch_android_lite:2.1.0'
     implementation 'org.pytorch:pytorch_android_torchvision_lite:2.1.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }

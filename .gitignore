@@ -1,1 +1,5 @@
 camera2/.gradle_user_home/
+server/data/
+server/.env
+**/__pycache__/
+*.pyc
