@@ -2,6 +2,8 @@
 package com.example.camera2;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
@@ -13,15 +15,21 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.provider.Settings;
+import android.util.Log;
 import android.util.Size;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -41,6 +49,7 @@ import java.io.InputStream;
 import java.util.Arrays;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "MainActivity";
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 100;
     private static final String MODEL_ASSET_NAME = "forest_fire_classifier_mobilenetv3_small.ptl";
     private static final int FIRE_CLASS_INDEX = 0;
@@ -56,6 +65,7 @@ public class MainActivity extends AppCompatActivity {
 
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
+    private boolean hasPromptedForAllFilesAccess = false;
 
     // Define the SurfaceTextureListener
     private final TextureView.SurfaceTextureListener textureListener = new TextureView.SurfaceTextureListener() {
@@ -111,7 +121,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         try {
-            module = LiteModuleLoader.load(assetFilePath(MODEL_ASSET_NAME));
+            module = LiteModuleLoader.load(assetFilePath(MODEL_ASSET_NAME, true));
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -182,21 +192,27 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void captureAndProcessImage() {
-        Bitmap bitmap = textureView.getBitmap(imageSize.getWidth(), imageSize.getHeight());
-        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 224, 224, false);
+        Bitmap bitmap = textureView.getBitmap();
+        if (bitmap == null) {
+            return;
+        }
+
+        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true);
+        Bitmap centerCroppedBitmap = Bitmap.createBitmap(resizedBitmap, 16, 16, 224, 224);
+        dumpPreprocessedImage(centerCroppedBitmap);
 
         final Tensor inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
-                resizedBitmap,
+                centerCroppedBitmap,
                 TensorImageUtils.TORCHVISION_NORM_MEAN_RGB,
                 TensorImageUtils.TORCHVISION_NORM_STD_RGB
         );
 
         Tensor outputTensor = module.forward(IValue.from(inputTensor)).toTensor();
         float[] scores = outputTensor.getDataAsFloatArray();
+        Log.d(TAG, "scores=" + Arrays.toString(scores));
 
-        int maxScoreIdx = getMaxScoreIndex(scores);
-
-        if (maxScoreIdx == FIRE_CLASS_INDEX) {
+        boolean isFire = scores[FIRE_CLASS_INDEX] > scores[1];
+        if (isFire) {
             tvResult.setText("FIRE");
             tvResult.setTextColor(getResources().getColor(android.R.color.holo_red_dark));
         } else {
@@ -205,21 +221,76 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private int getMaxScoreIndex(float[] scores) {
-        int maxIndex = 0;
-        float maxScore = scores[0];
-        for (int i = 1; i < scores.length; i++) {
-            if (scores[i] > maxScore) {
-                maxScore = scores[i];
-                maxIndex = i;
-            }
+    private void dumpPreprocessedImage(Bitmap bitmap) {
+        long timestampMs = System.currentTimeMillis();
+        String filename = timestampMs + ".png";
+
+        File primaryDir = new File("/sdcard/tmp");
+        File primaryFile = new File(primaryDir, filename);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            Log.w(TAG, "No all-files access; /sdcard/tmp write may fail. Falling back if needed.");
+            promptForAllFilesAccessOnce();
         }
-        return maxIndex;
+
+        if (tryWritePng(bitmap, primaryFile)) {
+            Log.d(TAG, "Wrote preprocessed image: " + primaryFile.getAbsolutePath());
+            return;
+        }
+
+        File fallbackDir = new File(getExternalFilesDir(null), "tmp");
+        File fallbackFile = new File(fallbackDir, filename);
+        if (tryWritePng(bitmap, fallbackFile)) {
+            Log.w(TAG, "Wrote preprocessed image to app storage instead: " + fallbackFile.getAbsolutePath());
+        } else {
+            Log.e(TAG, "Failed to write preprocessed image to disk.");
+        }
     }
 
-    private String assetFilePath(String assetName) throws IOException {
+    private void promptForAllFilesAccessOnce() {
+        if (hasPromptedForAllFilesAccess) {
+            return;
+        }
+        hasPromptedForAllFilesAccess = true;
+
+        Toast.makeText(
+                this,
+                "To write /sdcard/tmp, enable 'All files access' for this app in Settings.",
+                Toast.LENGTH_LONG
+        ).show();
+
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (ActivityNotFoundException e) {
+            startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+        }
+    }
+
+    private boolean tryWritePng(Bitmap bitmap, File outFile) {
+        File parent = outFile.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            Log.w(TAG, "Failed to create directory: " + parent.getAbsolutePath());
+            return false;
+        }
+
+        try (FileOutputStream os = new FileOutputStream(outFile)) {
+            boolean ok = bitmap.compress(Bitmap.CompressFormat.PNG, 100, os);
+            os.flush();
+            if (!ok) {
+                Log.w(TAG, "Bitmap.compress returned false for: " + outFile.getAbsolutePath());
+            }
+            return ok;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to write PNG: " + outFile.getAbsolutePath(), e);
+            return false;
+        }
+    }
+
+    private String assetFilePath(String assetName, boolean forceOverwrite) throws IOException {
         File file = new File(getFilesDir(), assetName);
-        if (file.exists() && file.length() > 0) {
+        if (!forceOverwrite && file.exists() && file.length() > 0) {
             return file.getAbsolutePath();
         }
 
@@ -283,4 +354,3 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 }
-
